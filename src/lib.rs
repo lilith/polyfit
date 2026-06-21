@@ -480,6 +480,7 @@ pub mod transforms;
 pub mod basis;
 pub mod display;
 pub mod error;
+pub mod eval;
 pub mod rational;
 pub mod score;
 pub mod statistics;
