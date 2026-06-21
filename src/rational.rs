@@ -133,13 +133,44 @@ pub enum ConstraintMode {
 }
 
 /// A point constraint: the rational polynomial must pass through (x, y).
+///
+/// # All `Constraint` weights are *soft* penalties, not hard pins
+///
+/// Despite the name and the default weight of `1e6`, every `Constraint`
+/// participates in the fit's least-squares objective as a
+/// `weight * (P(x_i)/Q(x_i) - y_i)²` term — a *penalty*, not a *pin*.
+/// The Sanathanan-Koerner iteration and the Levenberg-Marquardt
+/// refinement will trade a small constraint violation for a small
+/// bulk-domain accuracy gain whenever the overall objective improves.
+/// Even with `weight = 1e6` the fitted polynomial can drift from the
+/// constraint point — for `f(0) = 0` in particular, expect drift on the
+/// order of the bulk-domain absolute error.
+///
+/// If you need an *exact* hit at the constraint point (e.g., to make a
+/// piecewise function continuous at its threshold), use
+/// [`ConstraintMode::SnapOnly`] (the default) or
+/// [`ConstraintMode::SkThenSnap`]: after fitting, the constant term
+/// `p[0]` is adjusted so `P(x)/Q(x) = y` exactly at the constraint
+/// point. See [`RationalPolynomial::snap_boundary`] for the math.
+///
+/// For the special case `f(0) = 0` with the goal of saving a constant
+/// load in a SIMD evaluator: a "substitution trick" is more reliable
+/// than any constraint — fit `f(x)/x` (or `f(√x)/√x` etc.) and
+/// multiply by `x` at evaluation time, which makes `c[0] = 0` exact by
+/// construction.
 #[derive(Debug, Clone, Copy)]
 pub struct Constraint<T: Value = f64> {
     /// The x coordinate of the constraint.
     pub x: T,
     /// The y value the rational polynomial must match.
     pub y: T,
-    /// How strongly to enforce (default: 1e6). Higher = harder constraint.
+    /// How strongly to weight this constraint in the least-squares
+    /// objective (default: `1e6`).
+    ///
+    /// **This is a soft penalty multiplier, not a hard equality** —
+    /// arbitrarily large weights still let the optimizer trade a tiny
+    /// constraint residual for a bulk-domain accuracy gain. See the
+    /// [`Constraint`] type-level docs for the workaround.
     pub weight: T,
 }
 
@@ -369,7 +400,14 @@ impl Default for RationalFitOptions<f32> {
 }
 
 impl<T: Value> Constraint<T> {
-    /// Create a hard constraint at (x, y) with default weight 1e6.
+    /// Create a soft point constraint at `(x, y)` with the default
+    /// weight `1e6`.
+    ///
+    /// **Despite the high default weight, this is not a hard pin** —
+    /// see the [`Constraint`] type-level docs. For an exact-match
+    /// guarantee at the constraint point, pair this with
+    /// [`ConstraintMode::SnapOnly`] (the default) or
+    /// [`ConstraintMode::SkThenSnap`].
     pub fn new(x: T, y: T) -> Self {
         Self {
             x,
@@ -378,9 +416,27 @@ impl<T: Value> Constraint<T> {
         }
     }
 
-    /// Create a constraint with custom weight.
-    pub fn with_weight(x: T, y: T, weight: T) -> Self {
+    /// Create a soft point constraint at `(x, y)` with a caller-chosen
+    /// penalty weight.
+    ///
+    /// The `weight` is a multiplier on the `(P(x)/Q(x) - y)²` term in
+    /// the least-squares objective — **not a hard equality**. Arbitrarily
+    /// large weights are tolerated by SK/LM but never produce an exact
+    /// pin. For exact-match behavior at the constraint point, see the
+    /// [`Constraint`] type-level docs.
+    pub fn soft(x: T, y: T, weight: T) -> Self {
         Self { x, y, weight }
+    }
+
+    /// Create a constraint with custom weight.
+    ///
+    /// This is the historical name for [`Constraint::soft`] — both
+    /// produce identical soft (penalty-weighted) constraints. New code
+    /// should prefer [`Constraint::soft`] because the name does not
+    /// invite the misreading "high weight = hard pin." See the
+    /// [`Constraint`] type-level docs.
+    pub fn with_weight(x: T, y: T, weight: T) -> Self {
+        Self::soft(x, y, weight)
     }
 }
 
@@ -2494,5 +2550,29 @@ mod tests {
 
         // Display doesn't panic.
         let _ = format!("{report}");
+    }
+
+    /// `Constraint::soft` is a direct alias for `with_weight` — both
+    /// produce identical constraints with identical fit behavior. New
+    /// callers should prefer `soft` because the name doesn't invite the
+    /// misreading "high weight = hard pin."
+    #[test]
+    fn constraint_soft_is_with_weight_alias() {
+        let a = Constraint::<f64>::soft(0.5, 0.25, 1e3);
+        let b = Constraint::<f64>::with_weight(0.5, 0.25, 1e3);
+        assert_eq!(a.x.to_bits(), b.x.to_bits());
+        assert_eq!(a.y.to_bits(), b.y.to_bits());
+        assert_eq!(a.weight.to_bits(), b.weight.to_bits());
+
+        // And the new constructor produces a usable constraint that the
+        // fitter accepts end-to-end (smoke check — does not assert exact
+        // boundary match because soft constraints don't pin).
+        let options = RationalFitOptions {
+            constraints: vec![Constraint::soft(0.04, (0.04_f64).powf(2.4), 1e6)],
+            ..RationalFitOptions::default()
+        };
+        let fit =
+            RationalFit::from_function(|x: f64| x.powf(2.4), 0.04..=1.0, 4, 4, options).unwrap();
+        assert!(fit.r_squared() > 0.999_999, "R² = {}", fit.r_squared());
     }
 }
