@@ -273,12 +273,45 @@ impl<T: Value> fmt::Display for BoundaryReport<T> {
 }
 
 /// How the f32 search scores candidate coefficients.
+///
+/// # When NOT to trust [`F32ScoreMetric::Ulp`]
+///
+/// The ULP metric measures distance in units-in-the-last-place of the
+/// reference function's f32 output. **ULP distance balloons whenever the
+/// reference output approaches zero** because f32 has very fine resolution
+/// near zero (a single bit-flip near subnormal magnitudes can correspond to
+/// `~1e9` ULPs). For these reference functions, switch to
+/// [`F32ScoreMetric::AbsoluteError`]:
+///
+/// - `x^p` for `0 < p < 1` (square root, cube root, the sRGB `1/2.4`
+///   exponent) on any domain that includes `x ≈ 0`
+/// - `log(x)`, `ln(1+x)`, `arcsinh(x)` near `x = 0`
+/// - `1/x` and other functions whose output passes near zero
+/// - Any function whose codomain spans many orders of magnitude
+///
+/// As a rule of thumb: if `min(|f(x)|) < 1e-2 * max(|f(x)|)` over the
+/// sweep domain, the ULP metric will report misleading numbers and you
+/// should use absolute error instead. A sub-`1e-4` absolute-error fit can
+/// trivially show `max_ulp ≈ 1e9` for these functions while being entirely
+/// usable.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum F32ScoreMetric {
-    /// Score by ULP distance (best for transfer functions with bounded output).
+    /// Score by ULP distance.
+    ///
+    /// Best for transfer functions whose output stays bounded *away from
+    /// zero* (sRGB EOTF on `[threshold, 1]`, PQ on `[threshold, 1]`, etc.)
+    /// where the f32 ULP grid is uniform enough that ULPs track absolute
+    /// error linearly. See the enum-level documentation for the cases
+    /// where this metric is misleading.
     #[default]
     Ulp,
-    /// Score by absolute error (best when output crosses zero, e.g., log2 mantissa).
+    /// Score by absolute error.
+    ///
+    /// Use when the reference output passes near zero (output crosses
+    /// zero, or is dense near subnormal magnitudes), where ULP distance
+    /// stops tracking absolute error linearly. Specifically: `x^p` for
+    /// `0 < p < 1`, `log(x)` near zero, mantissa-of-`log2` style outputs,
+    /// or any function whose codomain spans many decades.
     AbsoluteError,
 }
 
@@ -309,6 +342,27 @@ impl Default for F32SearchConfig {
 }
 
 /// Result of f32 coefficient optimization.
+///
+/// # Picking the right quality metric
+///
+/// Both the ULP fields (`max_ulp`, `avg_ulp`, `boundary_ulp`) and the
+/// absolute-error fields (`max_abs_err`, `avg_abs_err`) are reported on
+/// every result regardless of which [`F32ScoreMetric`] the optimizer
+/// scored against. The "right" number to read depends on the reference
+/// function:
+///
+/// - If the reference output stays bounded *away from zero* over the
+///   sweep domain (most piecewise transfer functions in their power
+///   segment): trust `max_ulp` / `boundary_ulp`.
+/// - If the reference output approaches zero anywhere in the sweep
+///   domain (`x^p` for `0 < p < 1`, `log(x)`, `1/x`, anything whose
+///   codomain spans many decades): the ULP fields will look
+///   catastrophic (often `~1e9`) even for sub-`1e-4` fits — read
+///   `max_abs_err` instead. See [`F32ScoreMetric`] for the full
+///   discussion.
+///
+/// `mono_violations` and `values_scored` / `exhaustive` are unconditional
+/// quality signals.
 #[derive(Debug, Clone)]
 pub struct F32SearchResult {
     /// Optimized f32 numerator coefficients.
@@ -316,14 +370,29 @@ pub struct F32SearchResult {
     /// Optimized f32 denominator coefficients.
     pub denominator: Vec<f32>,
     /// Maximum ULP error across the sweep domain.
+    ///
+    /// **Unreliable when the reference output approaches zero** — read
+    /// `max_abs_err` instead in that case. See [`F32SearchResult`]'s
+    /// type-level docs for guidance.
     pub max_ulp: u32,
     /// Average ULP error across the sweep domain.
+    ///
+    /// See the caveat on `max_ulp`: ULP averaging is also distorted when
+    /// the reference output approaches zero.
     pub avg_ulp: f64,
     /// ULP error at the domain start (boundary).
+    ///
+    /// See the caveat on `max_ulp`: if `sweep_lo` is near zero for a
+    /// fractional-power-style reference function, this number will look
+    /// huge even for a usable fit.
     pub boundary_ulp: u32,
     /// Number of monotonicity violations.
     pub mono_violations: u64,
     /// Maximum absolute error.
+    ///
+    /// The "ground truth" quality number when the reference output
+    /// approaches zero — see the caveats on the ULP fields and the
+    /// [`F32ScoreMetric`] docs.
     pub max_abs_err: f64,
     /// Average absolute error.
     pub avg_abs_err: f64,
